@@ -5,6 +5,7 @@
 #include <memory.h>
 #include <stdio.h>
 #include <stdint.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <limits.h>
 #include <errno.h>
@@ -14,15 +15,14 @@
 #include <fcntl.h>
 #include <signal.h>
 #include "socket.h"
+#include "message_counter.h"
 #include "error.h"
 
 static int pid_file;
 static char pid_pathname[PATH_MAX];
-
-/*
- * According to RFC 5424, the syslog size limit is 1024
- */
-#define BUFFER_SIZE 1024
+static char most_freq_msg[BUFFER_SIZE];
+static size_t most_freq_size;
+static size_t most_freq_count;
 
 struct message {
     char buffer[BUFFER_SIZE];
@@ -54,6 +54,12 @@ static void close_pid_file(void)
 static void handle_signal(int sig)
 {
     (void) sig;
+
+    if (most_freq_count) {
+        write(STDOUT_FILENO, most_freq_msg, most_freq_size);
+        write(STDOUT_FILENO, "\n", 1);
+    }
+
     exit(EXIT_SUCCESS);
 }
 
@@ -64,6 +70,48 @@ static void install_signal_handler(int sig)
     act.sa_handler = handle_signal;
     sigemptyset(&act.sa_mask);
     CHK(sigaction(sig, &act, &oldact));
+}
+
+static const char *find_digit(const char *s, const char *boundary)
+{
+    while (s < boundary && !isdigit(*s)) ++s;
+    return s;
+}
+
+// Look for HH:MM:SS or HH-MM-SS format and skip it
+static const char *skip_timestamp(const char *msg, size_t size)
+{
+#define CHECK_DIGIT(p) if (p >= boundary || !isdigit(*p)) continue
+#define CHECK_SEP(p) if (p >= boundary || (*p != ':' && *p != '-')) continue
+#define CHECK_CHUNK(p) \
+    do { \
+        CHECK_DIGIT(p); \
+        ++p; \
+        CHECK_DIGIT(p); \
+        ++p; \
+    } while (0);
+
+    const char *p = msg;
+    const char *boundary = msg + size;
+    while (p < boundary) {
+        p = find_digit(p, boundary);
+        if (p == boundary) break;
+        CHECK_CHUNK(p);
+        CHECK_SEP(p);
+        ++p;
+        CHECK_CHUNK(p);
+        CHECK_SEP(p);
+        ++p;
+        CHECK_CHUNK(p);
+        break;
+        
+    }
+
+    // If the timestamp was not found return the whole message
+    return p < boundary ? p : msg;
+#undef CHECK_CHUNK
+#undef CHECK_DIGIT
+#undef CHECK_POS
 }
 
 int main(int argc, char *argv[])
@@ -139,6 +187,9 @@ int main(int argc, char *argv[])
     struct message *current = buffer;
     struct message *last = buffer + 1;
 
+    message_counter_t counter;
+    msgcount_init(&counter);
+
     const int log_socket = create_socket(socket_path);
 
     do {
@@ -147,6 +198,22 @@ int main(int argc, char *argv[])
                 // detect duplicate messages
                 if (current->size == last->size && !memcmp(current->buffer, last->buffer, current->size))
                     continue;
+
+                /*
+                 * The format we receive from the logger client can vary a lot
+                 * (see https://www.rsyslog.com/doc/master/whitepapers/syslog_parsing.html)
+                 * The strategy that we adopted is to skip the timestamp and then
+                 * compare the messages
+                 */
+                const char *p = skip_timestamp(current->buffer, current->size);
+                const size_t size = current->size - (p - current->buffer);
+                const size_t msg_count = msgcount_incr(&counter, p, size);
+
+                if (msg_count > most_freq_count) {
+                    memcpy(most_freq_msg, current->buffer, current->size);
+                    most_freq_size = current->size;
+                    most_freq_count = msg_count;
+                }
 
                 for (size_t i = 0; i <= nfiles; ++i) {
                     CHK(write(fds[i], current->buffer, current->size));
